@@ -2,12 +2,18 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio import pairwise2
 from Bio.pairwise2 import format_alignment
+from Bio.Align import PairwiseAligner
 import os
 from docx import Document
 from docx.shared import RGBColor, Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_LINE_SPACING
 import re
 from fpdf import FPDF
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from Bio.SeqUtils import GC, molecular_weight
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
 class SequenceAnalyzer:
     def __init__(self):
@@ -15,6 +21,8 @@ class SequenceAnalyzer:
         self.reference_protein = None
         self.start_seq = None
         self.end_seq = None
+        self.quality_threshold = 20
+        self.cpu_count = multiprocessing.cpu_count()
         
     def read_ab1(self, file_path):
         """Read an AB1 file and return the sequence record"""
@@ -23,6 +31,35 @@ class SequenceAnalyzer:
             return record
         except Exception as e:
             raise Exception(f"Error reading AB1 file: {str(e)}")
+            
+    def read_multiple_formats(self, file_path):
+        """Read multiple sequence file formats"""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        try:
+            if file_ext == '.ab1':
+                return SeqIO.read(file_path, "abi")
+            elif file_ext in ['.fasta', '.fa', '.fas']:
+                return SeqIO.read(file_path, "fasta")
+            elif file_ext in ['.fastq', '.fq']:
+                return SeqIO.read(file_path, "fastq")
+            elif file_ext in ['.gb', '.gbk']:
+                return SeqIO.read(file_path, "genbank")
+            elif file_ext == '.embl':
+                return SeqIO.read(file_path, "embl")
+            elif file_ext == '.txt':
+                with open(file_path, 'r') as f:
+                    content = f.read().strip()
+                    clean_content = re.sub(r'[^ATGCN]', '', content.upper())
+                    if len(clean_content) > len(content) * 0.8:
+                        from Bio.SeqRecord import SeqRecord
+                        return SeqRecord(Seq(clean_content), id="sequence")
+                    else:
+                        raise Exception("File doesn't appear to contain sequence data")
+            else:
+                raise Exception(f"Unsupported file format: {file_ext}")
+        except Exception as e:
+            raise Exception(f"Error reading file {file_path}: {str(e)}")
 
     def set_reference(self, reference_seq):
         """Set the reference sequence and its protein translation"""
@@ -32,6 +69,31 @@ class SequenceAnalyzer:
             self.reference_protein = str(Seq(self.reference_seq).translate())
         except Exception as e:
             raise Exception(f"Error translating reference sequence: {str(e)}")
+            
+    def calculate_sequence_statistics(self, sequence):
+        """Calculate comprehensive sequence statistics"""
+        sequence = sequence.upper()
+        length = len(sequence)
+        
+        base_counts = {
+            'A': sequence.count('A'),
+            'T': sequence.count('T'),
+            'G': sequence.count('G'),
+            'C': sequence.count('C'),
+            'N': sequence.count('N')
+        }
+        
+        base_percentages = {base: (count / length) * 100 for base, count in base_counts.items()}
+        gc_content = GC(sequence)
+        mol_weight = molecular_weight(sequence, seq_type='DNA')
+        
+        return {
+            'length': length,
+            'base_counts': base_counts,
+            'base_percentages': base_percentages,
+            'gc_content': gc_content,
+            'molecular_weight': mol_weight
+        }
 
     def clean_sequence(self, sequence):
         """Clean DNA sequence by removing non-DNA characters and whitespace"""
@@ -40,6 +102,26 @@ class SequenceAnalyzer:
         # Remove any non-DNA characters (keeping only A, T, G, C, N)
         sequence = re.sub(r'[^ATGCN]', '', sequence)
         return sequence
+        
+    def quality_filter_sequence(self, record, threshold=None):
+        """Filter sequence based on quality scores"""
+        if threshold is None:
+            threshold = self.quality_threshold
+            
+        if not hasattr(record, 'letter_annotations') or 'phred_quality' not in record.letter_annotations:
+            return str(record.seq)
+            
+        quality_scores = record.letter_annotations['phred_quality']
+        sequence = str(record.seq)
+        
+        filtered_seq = ""
+        for i, (base, quality) in enumerate(zip(sequence, quality_scores)):
+            if quality >= threshold:
+                filtered_seq += base
+            else:
+                filtered_seq += 'N'
+                
+        return filtered_seq
 
     def find_sequence_boundaries(self, seq_str):
         """Find the best matching region in the sequence"""
@@ -65,18 +147,49 @@ class SequenceAnalyzer:
                 
         raise Exception("Could not find a good matching region in either orientation")
 
-    def trim_sequence(self, seq):
+    def trim_sequence(self, seq, record=None):
         """Trim sequence based on best alignment with reference"""
         if not self.reference_seq:
             raise Exception("Reference sequence not set")
             
         seq_str = self.clean_sequence(str(seq))
         
+        # Use quality-based trimming if record is provided
+        if record and hasattr(record, 'letter_annotations') and 'phred_quality' in record.letter_annotations:
+            seq_str = self.advanced_trim_sequence(record)
+        
         try:
             start_idx, seq_str, end_idx = self.find_sequence_boundaries(seq_str)
             return seq_str[start_idx:end_idx]
         except Exception as e:
             raise Exception(f"Error trimming sequence: {str(e)}")
+            
+    def advanced_trim_sequence(self, record, quality_threshold=20, window_size=10):
+        """Advanced sequence trimming based on quality scores"""
+        sequence = str(record.seq)
+        
+        if not hasattr(record, 'letter_annotations') or 'phred_quality' not in record.letter_annotations:
+            return sequence
+            
+        quality_scores = record.letter_annotations['phred_quality']
+        
+        # Find start position
+        start_pos = 0
+        for i in range(len(quality_scores) - window_size):
+            window_avg = np.mean(quality_scores[i:i + window_size])
+            if window_avg >= quality_threshold:
+                start_pos = i
+                break
+                
+        # Find end position
+        end_pos = len(quality_scores)
+        for i in range(len(quality_scores) - window_size, window_size, -1):
+            window_avg = np.mean(quality_scores[i - window_size:i])
+            if window_avg >= quality_threshold:
+                end_pos = i
+                break
+                
+        return sequence[start_pos:end_pos]
 
     def format_alignment_emboss(self, seq1, seq2, aligned_seq1, aligned_seq2, score, filename, protein=False):
         """Format alignment in EMBOSS Water format"""
@@ -178,6 +291,20 @@ class SequenceAnalyzer:
         aligned_seq1, aligned_seq2, score, start, end = best_alignment
         
         return self.format_alignment_emboss(query_seq, ref_seq, aligned_seq1, aligned_seq2, score, filename, protein)
+        
+    def parallel_alignment(self, sequences, reference_seq):
+        """Perform alignments in parallel"""
+        def align_single(seq_data):
+            name, sequence = seq_data
+            alignments = pairwise2.align.globalms(sequence, reference_seq, 2, -1, -10, -0.5)
+            if alignments:
+                return name, alignments[0]
+            return name, None
+            
+        with ThreadPoolExecutor(max_workers=self.cpu_count) as executor:
+            results = list(executor.map(align_single, sequences.items()))
+            
+        return dict(results)
 
     def translate_dna(self, dna_sequence):
         """Translate DNA sequence to protein sequence"""
@@ -186,6 +313,58 @@ class SequenceAnalyzer:
             return str(Seq(clean_seq).translate())
         except Exception as e:
             raise Exception(f"Error translating DNA sequence: {str(e)}")
+            
+    def translate_all_frames(self, sequence):
+        """Translate sequence in all 6 reading frames"""
+        sequence = sequence.upper()
+        translations = {}
+        
+        # Forward frames
+        for frame in range(3):
+            frame_seq = sequence[frame:]
+            if len(frame_seq) >= 3:
+                protein = str(Seq(frame_seq).translate())
+                translations[f'Frame +{frame + 1}'] = protein
+                
+        # Reverse frames
+        rev_seq = str(Seq(sequence).reverse_complement())
+        for frame in range(3):
+            frame_seq = rev_seq[frame:]
+            if len(frame_seq) >= 3:
+                protein = str(Seq(frame_seq).translate())
+                translations[f'Frame -{frame + 1}'] = protein
+                
+        return translations
+        
+    def find_restriction_sites(self, sequence, enzymes=None):
+        """Find restriction enzyme sites"""
+        if enzymes is None:
+            enzymes = {
+                'EcoRI': 'GAATTC',
+                'BamHI': 'GGATCC',
+                'HindIII': 'AAGCTT',
+                'XbaI': 'TCTAGA',
+                'SacI': 'GAGCTC',
+                'KpnI': 'GGTACC',
+                'SmaI': 'CCCGGG',
+                'PstI': 'CTGCAG'
+            }
+            
+        sites = {}
+        sequence = sequence.upper()
+        
+        for enzyme, site in enzymes.items():
+            positions = []
+            start = 0
+            while True:
+                pos = sequence.find(site, start)
+                if pos == -1:
+                    break
+                positions.append(pos + 1)
+                start = pos + 1
+            sites[enzyme] = positions
+            
+        return sites
 
     def save_to_word(self, results, filename):
         """Save results to Word document with proper formatting"""
@@ -273,3 +452,85 @@ class SequenceAnalyzer:
         
         # Save PDF
         pdf.output(output_path)
+        
+    def export_advanced_results(self, results, output_path, format='pdf'):
+        """Export results with advanced formatting"""
+        if format.lower() == 'pdf':
+            self._export_advanced_pdf(results, output_path)
+        elif format.lower() == 'html':
+            self._export_html(results, output_path)
+        else:
+            raise Exception(f"Unsupported export format: {format}")
+
+    def _export_advanced_pdf(self, results, output_path):
+        """Export to PDF with advanced formatting"""
+        class AdvancedPDF(FPDF):
+            def header(self):
+                self.set_font('Arial', 'B', 15)
+                self.cell(0, 10, 'SeqAnalyse - Advanced Analysis Results', 0, 1, 'C')
+                self.ln(10)
+                
+            def footer(self):
+                self.set_y(-15)
+                self.set_font('Arial', 'I', 8)
+                self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+                
+        pdf = AdvancedPDF()
+        pdf.add_page()
+        
+        for analysis_type, samples in results.items():
+            pdf.set_font('Arial', 'B', 14)
+            pdf.cell(0, 10, f'{analysis_type.capitalize()} Analysis', 0, 1)
+            pdf.ln(5)
+            
+            for sample_name, result in samples.items():
+                pdf.set_font('Arial', 'B', 12)
+                pdf.cell(0, 8, f'Sample: {sample_name}', 0, 1)
+                
+                pdf.set_font('Courier', '', 8)
+                lines = result.split('\n')
+                for line in lines:
+                    if len(line) > 80:
+                        for i in range(0, len(line), 80):
+                            pdf.cell(0, 4, line[i:i+80], 0, 1)
+                    else:
+                        pdf.cell(0, 4, line, 0, 1)
+                pdf.ln(5)
+                
+        pdf.output(output_path)
+
+    def _export_html(self, results, output_path):
+        """Export results to HTML format"""
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>SeqAnalyse Results</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .header { background-color: #f0f0f0; padding: 10px; text-align: center; }
+                .analysis-section { margin: 20px 0; border: 1px solid #ccc; padding: 15px; }
+                .sample { margin: 10px 0; }
+                .sequence { font-family: 'Courier New', monospace; font-size: 12px; 
+                           background-color: #f9f9f9; padding: 10px; white-space: pre-wrap; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>SeqAnalyse - Advanced Analysis Results</h1>
+            </div>
+        """
+        
+        for analysis_type, samples in results.items():
+            html_content += f'<div class="analysis-section"><h2>{analysis_type.capitalize()} Analysis</h2>'
+            
+            for sample_name, result in samples.items():
+                html_content += f'<div class="sample"><h3>Sample: {sample_name}</h3>'
+                html_content += f'<div class="sequence">{result}</div></div>'
+                
+            html_content += '</div>'
+            
+        html_content += '</body></html>'
+        
+        with open(output_path, 'w') as f:
+            f.write(html_content)
