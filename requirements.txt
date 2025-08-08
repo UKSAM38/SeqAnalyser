@@ -1,0 +1,6 @@
+biopython>=1.81
+PyQt6>=6.4.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+python-docx>=0.8.11
+fpdf2>=2.7.0
