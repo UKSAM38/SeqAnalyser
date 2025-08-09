@@ -36,7 +36,7 @@ A comprehensive bioinformatics application for analyzing sequence files, perform
 1. Ensure you have Python 3.8 or higher installed
 2. Install the required dependencies:
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Usage
