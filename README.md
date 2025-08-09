@@ -33,11 +33,17 @@ A comprehensive bioinformatics application for analyzing sequence files, perform
 
 ## Installation
 
+### For Development
+If you want to run from source code:
 1. Ensure you have Python 3.8 or higher installed
 2. Install the required dependencies:
 ```bash
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
+
+### For macOS Users
+The application is available as a DMG package for easy installation on macOS.
+Simply download and install the DMG file - no additional setup required.
 
 ## Usage
 
